@@ -20,16 +20,19 @@ from ignite.engine import *
 import ttach as tta
 
 
+# final submission is ensemble of 2 models.
+# lr = 3e-4, drop_rate = 0.0
+# lr = 1e-4, drop_rate = 0.1
 
 class Cfg:
     model_name             = "maxvit_tiny_tf_512.in1k" # tf_efficientnet_b0, convnext_atto, maxvit_tiny_tf_512.in1k	
     img_size               = 512  
     num_classes            = 1
-    in_channels            = 1
+    in_channels            = 1    # 1, 13
     num_epochs             = 20
-    lr                     = 1e-4 #
-    batch_size             = 8  #
-    drop_rate              = 0.1
+    lr                     = 3e-4 # 1e-4, 3e-4
+    batch_size             = 8  
+    drop_rate              = 0.0  # 0.0, 0.1
     drop_path_rate         = 0.0
     iters_to_accumulate    = 1
     grad_clip              = None # None
@@ -39,7 +42,7 @@ class Cfg:
     adamW_eps              = 1e-08 # 1e-4, 1e-08
     warmup_steps_ratio     = 0.1
     n_data                 = -1 #-1
-    n_splits               = 1
+    n_splits               = 1  # 1, 5
 
     device                 = "cuda"
     use_amp                = False  
@@ -47,7 +50,7 @@ class Cfg:
     save_model             = True
     save_epochs            = [20]    
     num_workers            = 4
-    exp_name               = "1e4_L1_tta_bs8_flipver_test" 
+    exp_name               = "L1" 
     seed                   = 0
 
 
@@ -65,13 +68,6 @@ class NetDataset(Dataset):
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 # A.ShiftScaleRotate(rotate_limit=30, scale_limit=0.2, p=0.75),  
-                # A.RandomResizedCrop(
-                #     self.cfg.img_size,
-                #     self.cfg.img_size,
-                #     scale=(0.75, 1.0),
-                #     ratio=(0.75, 1.3333333333333),
-                #     p=0.5,
-                # ),
                 ToTensorV2(), # HWC to CHW
             ]
         )
@@ -90,13 +86,14 @@ class NetDataset(Dataset):
     def __getitem__(self, i):
         row = self.df.iloc[i]
         with rasterio.open("train_images/" + row.filename) as img:
-            x = img.read().astype(np.float32)  #[1:4] [[1,2,3,4]]
+            x = img.read().astype(np.float32)  
 
-        x = np.concatenate((x, x[1:4]))
+        # concat images horizontally and vertically(16x128x128 -> 512x512)
+        x = np.concatenate((x, x[1:4])) # add 3 extra channel to make 4x4
         img_rows = []
         for min_id in range(0, 16, 4):
             img_row = np.hstack([i for i in x[min_id:min_id+4]])
-            img_rows.append(img_row) #.transpose(2, 1, 0)
+            img_rows.append(img_row) 
         x = np.vstack(img_rows)
 
         x = np.where(x < 0, 0, x)
@@ -149,18 +146,14 @@ def Datasetloader(df, cfg, fold):
     return trainloader, validloader
 
 
-def train_one_epoch(model, trainloader, cfg, scaler, optimizer, scheduler, epoch, fold, loss_fn, loss_fn2):
+def train_one_epoch(model, trainloader, cfg, scaler, optimizer, scheduler, epoch, fold, loss_fn):
     epoch_loss = 0.0
     model.train()
-    for i, (x,y) in enumerate(tqdm(trainloader)): #tqdm
+    for i, (x,y) in enumerate(tqdm(trainloader)): 
         x, y = x.to(cfg.device), y.to(cfg.device)
         with torch.autocast(device_type=cfg.device, dtype=torch.float16, enabled=cfg.use_amp):
             logits = model(x)
             loss = loss_fn(logits.squeeze(), y) 
-            # logits = torch.ones((cfg.batch_size, cfg.num_classes), requires_grad=True).to(cfg.device)
-            # if loss_fn2 != None:
-            #     loss2 = loss_fn2(logits, y)
-            #     loss = (loss + loss2) / 2
         
         loss = loss / cfg.iters_to_accumulate
         scaler.scale(loss).backward() # loss.backward()
@@ -176,35 +169,30 @@ def train_one_epoch(model, trainloader, cfg, scaler, optimizer, scheduler, epoch
         epoch_loss += loss.item() * x.size(0)
 
     if (epoch+1) in cfg.save_epochs and cfg.save_model:
-        torch.save(model.state_dict(), f"models/{cfg.model_name}_{cfg.exp_name}_fold{fold}_epoch{epoch+1}.pt") 
+        torch.save(model.state_dict(), f"models/{cfg.model_name}_{cfg.exp_name}_fold{fold}_epoch{epoch+1}_{cfg.lr}.pt") 
     
     return epoch_loss
 
 
-def eval_model(model, validloader, cfg, loss_fn, loss_fn2, epoch):
+def eval_model(model, validloader, cfg, loss_fn, epoch):
     epoch_loss = 0.0
     preds, labels = [], []
 
     transforms = tta.Compose(
         [
             tta.HorizontalFlip(),
-            tta.Rotate90(angles=[0, 180]),
-            # tta.Scale(scales=[1, 2, 4]),
-            # tta.Multiply(factors=[0.9, 1, 1.1]),        
+            tta.Rotate90(angles=[0, 180]),       
         ]
     )
     model = tta.ClassificationTTAWrapper(model, transforms)
 
     model.eval()
-    for (x, y) in tqdm(validloader): #tqdm
+    for (x, y) in tqdm(validloader): 
         x, y = x.to(cfg.device), y.to(cfg.device)
         with torch.inference_mode():  
             with torch.autocast(device_type=cfg.device, dtype=torch.float16, enabled=cfg.use_amp):
                 logits = model(x).squeeze()
                 loss = loss_fn(logits, y) 
-                # if loss_fn2 != None:
-                #     loss2 = loss_fn2(logits, y)
-                #     loss = (loss + loss2) / 2
 
         preds.append(logits.detach().cpu())
         labels.append(y.detach().cpu())
@@ -263,13 +251,12 @@ def train(df, cfg):
             print(f"Epoch {epoch+1}/{cfg.num_epochs}")
 
             # Training
-            running_loss = train_one_epoch(model, trainloader, cfg, scaler, optimizer, scheduler, epoch, fold, loss_fn, loss_fn2)  
+            running_loss = train_one_epoch(model, trainloader, cfg, scaler, optimizer, scheduler, epoch, fold, loss_fn)  
             train_epoch_loss = running_loss / len(trainloader.dataset)
-            # print(f"Train Loss: {train_epoch_loss:.4f} ") 
 
             # Validation
             if validloader != None:
-                running_loss, score = eval_model(model, validloader, cfg, loss_fn, loss_fn2, epoch)
+                running_loss, score = eval_model(model, validloader, cfg, loss_fn, epoch)
                 valid_epoch_loss = running_loss / len(validloader.dataset)
                 print(f"Train Loss: {train_epoch_loss:.4f} | Valid Loss: {valid_epoch_loss:.4f} | Score: {score:.4f}") 
                 if epoch == cfg.num_epochs-1:
